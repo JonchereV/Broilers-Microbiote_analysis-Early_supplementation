@@ -1,0 +1,649 @@
+---
+title: "Analyse Microbiote INTEGRITY"
+author: "vincent"
+date: "04/09/2024"
+output:
+  html_document: default
+  pdf_document: default
+---
+# DADA2: Génération des ASVs (OTU) TUTORIAL USED
+library dada2
+ https://benjjneb.github.io/dada2/tutorial.html
+library  phyloses
+ https://vaulot.github.io/tutorials/Phyloseq_tutorial.html
+
+```{r}
+library(dada2); packageVersion("dada2")
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(readxl)
+```
+---
+
+
+## CHANGE ME to the directory containing the fastq files after unzipping.
+```{r }
+path <- "/home/vijonchere/Bureau/4.Projet.en.cours/INTEGRITY/1.Microbiome/Analyse/fastQ"
+list.files(path)
+```
+
+Forward and reverse fastq filenames have format: SAMPLENAME_L001_R1.fastq and SAMPLENAME_L001_R2.fastq
+```{r }
+fnFs <- sort(list.files(path, pattern="L001_R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="L001_R2.fastq", full.names = TRUE))
+```
+
+
+##  Extract sample names
+assuming filenames have format: SAMPLENAME_XXX.fastq
+```{r }
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+##  Trimimg 
+### FORWARD
+In gray-scale is a heat map of the frequency of each quality score at each base position. 
+The mean quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. 
+The red line shows the scaled proportion of reads that extend to at least that position 
+(this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+
+
+```{r }
+plotQualityProfile(fnFs[1:2])  
+```
+
+### Trimimg BACKWARD
+Like fastqc, we set the score for trimming at around 30, so here I'm trimming at 240. 
+FYI dada2 takes into account the quality of reads, but it's still better if you trim.
+```{r }
+plotQualityProfile(fnRs[1:2])
+```
+
+
+
+
+
+
+### Place filtered files in filtered/ subdirectory
+```{r }
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,235),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE) 
+head(out)
+```
+
+
+## Learn the Error Rates
+the black line shows the estimated error rates after convergence of the machine-learning algorithm.
+The red line shows the error rates expected under the nominal definition of the Q-score.
+
+```{r }
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+
+```{r }
+plotErrors(errF, nominalQ=TRUE)
+```
+
+The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. T
+
+```{r }
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+```
+
+Return the number of keeping reads
+```{r }
+dadaFs[[1]]
+```
+Algorithm DADA2 deduced 221 real sequence variants from the unique sequences of 11221 in the first sample. 
+
+idem backward
+```{r }
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+dadaRs[[1]]
+```
+
+##Merge
+Merge paired reads
+
+```{r }
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+```
+
+Inspect the merger data.frame from the first sample
+```{r }
+head(mergers[[1]])
+```
+The mergers object is a list of data.frames from each sample.
+Each data.frame contains the merged $sequence, its $abundance, 
+and the indices of the $forward and $reverse sequence variants that were merged. 
+Paired reads that did not exactly overlap were removed by mergePairs, further reducing spurious output.
+
+
+
+##Construct sequence table
+amplicon sequence variant table (ASV) 
+
+```{r }
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+Inspect distribution of sequence lengths
+```{r }
+table(nchar(getSequences(seqtab)))
+plot(density(nchar(getSequences(seqtab))))
+```
+The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants.
+This table contains 24222 ASVs, and the lengths of our merged sequences all fall within the expected range for this V4 amplicon.
+
+
+## Remove chimeras
+The core dada method corrects substitution and indel errors, but chimeras remain
+```{r }
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+```
+
+```{r }
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+The frequency of chimeric sequences varies substantially from dataset to dataset, and depends on on factors including experimental procedures and sample complexity. 
+the abundances of those variants we see they account for only about 30% of the merged sequence reads.
+
+
+##Track reads through the pipeline
+```{r }
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+## Assign taxonomy
+We assign the ASV with what is conu
+!!! Remember to update !!!
+Silva 138.1 prokaryotic SSU taxonomic training data formatted for DADA2
+https://zenodo.org/record/4587955#.YGXA3RI68UE
+
+```{r }
+taxa <- assignTaxonomy(seqtab.nochim, "/home/vijonchere/Bureau/4.Projet.en.cours/INTEGRITY/1.Microbiome/Analyse/silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE)
+taxa <- addSpecies(taxa, "silva_species_assignment_v138.1.fa.gz")
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+back Up
+```{r }
+saveRDS(seqtab.nochim, "seqtabIntegrity.rds")
+write.csv(seqtab.nochim,'sequences_Integrity.txt')
+```
+### species addition
+Extension Optionnel pour avoir une lecture niveaux de l'espece: The dada2 package also implements a method to make species level assignments based on exact matching between ASVs and sequenced reference strains. 
+Recent analysis suggests that exact matching (or 100% identity) is the only appropriate way to assign species to 16S gene fragments. #
+Currently, species-assignment training fastas are available for the Silva and RDP 16S databases. 
+```{r }
+saveRDS(taxa,'tax_all_Integrity.rds')
+save.image("Rdata_Integrity.rdata")
+```
+
+Here we look at the number of ASVs generated by Dada2
+```{r }
+dim(seqtab.nochim)
+```
+This gives us 128 samples and 2977 unique annotated ASVs.
+
+#Visualization
+## meta data import
+Data import
+```{r }
+load("/home/vijonchere/Bureau/4.Projet.en.cours/INTEGRITY/1.Microbiome/Analyse/Rdata_Integrity.rdata")
+library(dada2); packageVersion("dada2")
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(readxl)
+```
+
+
+export sample names to create a sam manually
+```{r }
+write.csv(sample.names, file='sampleNamesInnovafeed.csv')
+```
+sam reimport
+```{r }
+samples_df <- read_excel("Samples.xlsx")
+samples = sample_data(samples_df)
+rownames(samples) <- samples$sample_names
+```
+sam reformatting 
+```{r }
+samples$date <- gsub("J23", "J22",samples$date)
+samples$Group <- paste(samples$treatment, samples$date, samples$infection, sep="-")
+```
+
+OTU table - in reality, these are ASVs supplied by DADA2
+```{r }
+OTU = otu_table(seqtab.nochim, taxa_are_rows = FALSE)
+```
+Taxonomy
+```{r }
+TAX = tax_table(taxa)
+```
+##Creating a phyloseq object
+```{r }
+physeq = phyloseq(OTU, TAX, samples)
+```
+We remove three aberrant samples (duplicats).
+```{r }
+physeq <- subset_samples(physeq, A.Censurer=="NO" )
+#physeq <- subset_samples(physeq, date=="YES" )
+```
+
+here we remove the ASV poorly represent
+```{r }
+physeq_raref<-rarefy_even_depth(physeq, sample.size = min(sample_sums(physeq)),rngseed = 1, replace = FALSE, trimOTUs = TRUE, verbose = TRUE)
+```
+### Reorder
+
+```{r }
+sample_names(physeq_raref)
+rank_names(physeq_raref)
+sample_variables(physeq_raref)
+```
+
+```{r }
+sample_names(physeq_raref) <- c("B.10A-J9","B.10B-J9","B.11A-J9","B.11B-J9","B.12A-J9","B.12B-J9","A.13A-J9","A.13B-J9","A.14A-J9","A.14B-J9","A.15A-J9","A.15B-J9","A.16A-J9","A.1A-J9","A.1B-J9","A.2A-J9","A.2B-J9","A.3A-J9","A.3B-J9","A.4A-J9","A.4B-J9","B.5A-J9","B.5B-J9","B.6A-J9","B.6B-J9","B.7A-J9","B.7B-J9","B.8A-J9","B.8B-J9")
+
+```
+Check
+```{r }
+sample_names(physeq_raref)
+```
+
+
+```{r plot_bar}
+plot_bar(physeq_raref, fill = "Family") +
+  geom_bar(aes(color=Family, fill=Family), stat="identity", position="stack") 
+
+png("bar.png", width = 900, height = 900, pointsize = 10)
+plot_bar(physeq_raref, fill = "Family") +
+  geom_bar(aes(color=Family, fill=Family), stat="identity", position="stack") 
+dev.off()
+```
+
+Observed= Nb of species observed
+Chao1, Shanon, Simpson, InvSimpson => methods for estimating the number of species (interesting for comparisons of data sets from several manipulations)
+
+alpha diversity
+```{r }
+alpha_div <- estimate_richness(physeq_raref, measures = c("Shannon", "Simpson", "Chao1"))
+alpha_div$Group <- sample_data(physeq_raref)$Group
+kruskal_test <- kruskal.test(Shannon ~ Group, data = alpha_div)
+wilcox_test <- pairwise.wilcox.test(alpha_div$Shannon, alpha_div$Group, p.adjust.method = "BH")
+kruskal_test$p.value
+wilcox_test$p.value
+
+kruskal_chao1 <- kruskal.test(Chao1 ~ Group, data = alpha_div)
+wilcox_chao1 <- pairwise.wilcox.test(alpha_div$Chao1, alpha_div$Group, p.adjust.method = "BH")
+kruskal_chao1$p.value
+wilcox_chao1$p.value
+
+kruskal_simpson <- kruskal.test(Simpson ~ Group, data = alpha_div)
+wilcox_simpson <- pairwise.wilcox.test(alpha_div$Simpson, alpha_div$Group, p.adjust.method = "BH")
+kruskal_simpson$p.value
+wilcox_simpson$p.value
+```
+
+```{r analyse richness}
+plot_richness(physeq_raref, color = "treatment", x = "treatment")
+png("richness.png", width = 900, height = 900, pointsize = 10)
+plot_richness(physeq_raref, color = "treatment", x = "treatment")
+dev.off()
+
+```
+
+
+   
+   
+
+### Parametric analyses on genus
+
+```{r }
+physeq_raref_gen<-tax_glom(physeq_raref, taxrank=rank_names(physeq)[6], NArm=TRUE, bad_empty=c(NA, "", " ", "\t"))
+```
+
+
+
+###nMDS
+tuto: https://archetypalecology.wordpress.com/2018/02/21/permutational-multivariate-analysis-of-variance-permanova-in-r-preliminary/
+or 
+https://microbiome.github.io/tutorials/PERMANOVA.html
+
+if aov is less than 0.05, this means that the variability in 1 or more groups is too different from the other groups.
+So if anova>0.05 we can continue
+
+
+```{r aov}
+numeric_Data<-otu_table(physeq_raref_gen)
+dim(numeric_Data)
+SAM <- as.matrix(sample_data(physeq_raref_gen))
+TAX_gen<-as.data.frame(tax_table(physeq_raref_gen))
+#check for heterogeneity of group dispersion
+dis<-vegdist(numeric_Data, method="bray")
+mod <- betadisper(dis, paste0(SAM[,"treatment"]) )
+# testing the null hypothesis that the dispersions are equals (rejecting it if P<0.05)
+anova(mod)
+```
+
+anova is not signif, we can continue  
+
+non-metric multidimensional scaling
+NMDS: reduction de dimension
+is to reduce information from multiple dimensions (e.g. multiple communities, sites, etc.) to just a few, so that it can be visualized and interpreted. Unlike other ordination techniques that rely on (mainly Euclidean) distances, such as principal coordinate analysis, NMDS uses rank orders, and is therefore an extremely flexible technique that can be adapted to a variety of different data types. 
+https://jonlefcheck.net/2012/10/24/nmds-tutorial-in-r/
+
+```{r }
+O_NMDS <- metaMDS(numeric_Data, k=2, trymax=15, autotransform = FALSE, wascores = TRUE)
+O_NMDS
+species.scores <- as.data.frame(scores(O_NMDS, "species"))
+SAM<-as.data.frame(SAM)
+plot(O_NMDS$points[,1],O_NMDS$points[,2], col=as.factor(SAM$Group), xlim=c(-1,1),ylim=c(-1,1))
+
+plot(O_NMDS$points[,1],O_NMDS$points[,2], col=c(rep("#1f78b4",6), rep("#33a02c",15),rep("#1f78b4",8)), xlim=c(-1,1),ylim=c(-1,1), pch=20, las=2, ylab="NMDS2", xlab="NMDS1")
+legend( x=0.5, y=1,legend=c("-","Enz"), col=c("#33a02c","#1f78b4"), pch=20, cex=0.8)
+
+png("NMDS.png")
+plot(O_NMDS$points[,1],O_NMDS$points[,2], col=c(rep("#1f78b4",6), rep("#33a02c",15),rep("#1f78b4",8)), xlim=c(-1,1),ylim=c(-1,1), pch=20, las=2, ylab="NMDS2", xlab="NMDS1")
+legend( x=0.5, y=1,legend=c("Enz"))
+
+dev.off()
+```
+No convergent solutions for NMDS
+
+
+# Define random elevations for previous example
+elevation=runif(10,0.5,1.5)
+# Use the function ordisurf to plot contour lines
+ordisurf(example_NMDS,elevation,main="",col="forestgreen")
+# Finally, display species on plot
+orditorp(example_NMDS,display="species",col="grey30",air=0.1,
+   cex=1)
+
+
+We show how the species (points) are distributed according to groups
+```{r }
+ordiplot(O_NMDS,type="n")
+orditorp(O_NMDS,display="species",col="red",air=0.01, labels = 'n')
+orditorp(O_NMDS,display="sites",cex=1.25,air=0.01, labels='n')
+ordispider(O_NMDS,groups=paste0(SAM$Group),label=T)
+# orditorp(example_NMDS,display="sites",col=c(rep("green",6),rep("blue",15),rep("green",8)),   air=0.01,cex=1.25)
+
+ordiplot(O_NMDS,type="n")
+orditorp(O_NMDS,display="species",col="red",air=0.01)
+orditorp(O_NMDS,display="sites",cex=1.25,air=0.01)
+
+
+png("ordispider.png")
+ordiplot(O_NMDS,type="n")
+orditorp(O_NMDS,display="species",col="red",air=0.01, labels = 'n')
+orditorp(O_NMDS,display="sites",cex=1.25,air=0.01, labels='n')
+ordispider(O_NMDS,groups=paste0(SAM$Group),label=T)
+dev.off()
+
+
+png("ordiplot2.png")
+example_NMDS <- O_NMDS  
+treat=c(rep("A",6),rep("B",15),rep("A",8))
+ordiplot(example_NMDS,type="n")
+ordihull(example_NMDS,groups=treat,draw="polygon",col=c("blue", "indianred3"),label=F)
+orditorp(example_NMDS,display="species",col="gray",air=0.01, labels = 'n')
+orditorp(example_NMDS,display="sites",col=c(rep("indianred3",6),rep("blue",15),rep("indianred3",8)),   air=0.01,cex=1.25)
+dev.off()
+```
+
+
+
+
+
+
+
+```{r }
+
+ gen_table<-otu_table(physeq_raref_gen)
+#physeq_raref_gen_filt: filter out the genera seen in less than 3 samples
+ physeq_raref_gen_filt<-prune_taxa(colSums(gen_table==0)<dim(gen_table)[1]-3,physeq_raref_gen)
+#gen_table_filt: table donnant le nb obs d'OTU par sample pour tout les OTU ayant été observés dans au moins 3 echantillons
+ gen_table_filt<-otu_table(physeq_raref_gen_filt)
+#SAM = SAM
+ SAM<-as.data.frame(as.matrix(sample_data(physeq_raref_gen)))
+
+#Annotation of OTUs  
+ tax <- as.data.frame(phyloseq::tax_table(physeq_raref_gen_filt), stringsAsFactors = F)
+#OTU + annotation des OTU + pval + padjust  , ,ncol=6 + nb var
+ #SAM$treatment*SAM$gender
+
+ val= 4
+ taxGen<-cbind(tax,matrix(nrow=dim(gen_table_filt)[2],ncol=val))
+
+SAM$treatment <- as.factor(SAM$treatment)
+SAM$gender <- as.factor(SAM$gender)
+
+```
+
+Beta diversity
+```{r }
+
+gen.dist <- vegdist(gen_table_filt, method="bray")
+
+# default test by terms
+
+gen.dist <- adonis2(gen_table_filt ~ SAM$Group, permutations = 999, method="bray")
+
+gen.dist
+# pval 0.315
+# overall tests
+
+
+```
+
+```{r }
+# load("/home/vijonchere/Bureau/4.Projet.en.cours/INTEGRITY/1.Microbiome/Analyse/4.J9/Rdata_Integrity.part1.rdata")
+
+library('DescTools')
+library("agricolae")
+library("tidyverse")
+library("ggpubr")
+library("rstatix")
+
+for (i in 1:dim(gen_table_filt)[2]){
+#for each OTUs
+gen_i<-gen_table[,i]
+
+fit <- lm(as.numeric(gen_i) ~  SAM$treatment*SAM$gender)
+
+for (j in 2:4){
+  taxGen[i,6+j]<-summary(fit)[["coefficients"]][, "Pr(>|t|)"][j]
+  colnames (taxGen)[6+j] <- names(summary(fit)[["coefficients"]][, "Pr(>|t|)"][j])
+}
+
+taxGen[i,11:12]<-aggregate(as.numeric(gen_i), list(paste0(SAM$treatment)), mean)[,2]
+colnames(taxGen)[11:12]<-unique(paste0(SAM$treatment))
+ }
+rownames(taxGen) <- as.integer(1:nrow(taxGen))
+
+
+```
+
+```{r }
+for (i in 8:10){  taxGen[,i+5] <- p.adjust(taxGen[,i], method="BH")}
+ colnames(taxGen)[13:15] <- paste(colnames(taxGen)[8:10], "padjust",sep="_")
+write.table(taxGen, "Results.microbiote.J9.txt", sep="\t", row.names = F)
+save.image("Rdata_Integrity.End.rdata")
+rm()
+load("Rdata_Integrity.End.rdata")
+
+
+#### PADJUST
+library("vioplot")
+
+taxGen[which(taxGen$`SAM$treatmentB_padjust`<0.05),5:6]
+
+gen_i <- gen_table[,which(taxGen$`SAM$treatmentB_padjust`<0.05)]
+tp <- data.frame(cbind(as.numeric(gen_i), paste0(SAM$treatment)))
+
+svg("Significant.Species.padjust.svg")
+boxplot(as.numeric(tp$X1)~tp$X2, las=2, ylab="Relative abundance", main= taxGen[which(taxGen$`SAM$treatmentB_padjust`<0.05),5:6], xlab="", xaxt="n")
+axis(1, at=1:2, labels=c("-", "Enz"))
+dev.off()
+
+
+tp$X1[which(tp$X2=="A")] <- as.numeric(tp$X1)[which(tp$X2=="A")]/sum(taxGen$A)
+tp$X1[which(tp$X2=="B")] <- as.numeric(tp$X1)[which(tp$X2=="B")]/sum(taxGen$B)
+svg("Significant.Species.padjust.2.svg")
+vioplot(as.numeric(tp$X1)~tp$X2, las=2, ylab="Relative abundance (%)", main= taxGen[which(taxGen$`SAM$treatmentB_padjust`<0.05),5:6], xlab="", xaxt="n")
+axis(1, at=1:2, labels=c("-", "Enz"))
+dev.off()
+
+taxGen[which(taxGen$`SAM$treatmentB`<0.05),5:6]
+
+which(taxGen$`SAM$treatmentB`<0.05)
+
+gen_i <- gen_table[,5]
+tp <- data.frame(cbind(as.numeric(gen_i), paste0(SAM$treatment)))
+
+tp$X1[which(tp$X2=="A")] <- as.numeric(tp$X1)[which(tp$X2=="A")]/sum(taxGen$A)
+tp$X1[which(tp$X2=="B")] <- as.numeric(tp$X1)[which(tp$X2=="B")]/sum(taxGen$B)
+100-(mean(as.numeric(tp$X1)[which(tp$X2=="B")])*100/mean(as.numeric(tp$X1)[which(tp$X2=="A")]))
+#43.62
+svg("Significant.Species.Lachnospiraceae.Eisenbergiella.svg")
+boxplot(as.numeric(tp$X1)~tp$X2, las=2, ylab="Relative abundance (%)", main= taxGen[5,5:6], xlab="", xaxt="n")
+axis(1, at=1:2, labels=c("-", "Enz"))
+dev.off()
+
+
+gen_i <- gen_table[,5]
+tp <- data.frame(cbind(as.numeric(gen_i), paste0(SAM$treatment)))
+tp$X1[which(tp$X2=="A")] <- as.numeric(tp$X1)[which(tp$X2=="A")]/sum(taxGen$A)
+tp$X1[which(tp$X2=="B")] <- as.numeric(tp$X1)[which(tp$X2=="B")]/sum(taxGen$B)
+
+
+svg("V.Significant.Species.Lachnospiraceae.Eisenbergiella.svg")
+vioplot(as.numeric(tp$X1)~tp$X2, las=2, ylab="Relative abundance (%)", main= taxGen[5,5:6], xlab="", xaxt="n")
+axis(1, at=1:2, labels=c("-", "Enz"))
+dev.off()
+
+gen_i <- gen_table[,13]
+tp <- data.frame(cbind(as.numeric(gen_i), paste0(SAM$treatment)))
+tp$X1[which(tp$X2=="A")] <- as.numeric(tp$X1)[which(tp$X2=="A")]/sum(taxGen$A)
+tp$X1[which(tp$X2=="B")] <- as.numeric(tp$X1)[which(tp$X2=="B")]/sum(taxGen$B)
+100-(median(as.numeric(tp$X1)[which(tp$X2=="B")])*100/median(as.numeric(tp$X1)[which(tp$X2=="A")]))
+#30.75
+svg("V.Significant.Species.Sphingomonadaceae.sphingomonas.svg")
+vioplot(as.numeric(tp$X1)~tp$X2, las=2, ylab="Relative abundance (%)", main= taxGen[13,5:6], xlab="", xaxt="n")
+axis(1, at=1:2, labels=c("-", "Enz"))
+dev.off()
+
+
+
+gen_i <- gen_table[,17]
+tp <- data.frame(cbind(as.numeric(gen_i), paste0(SAM$treatment)))
+tp$X1[which(tp$X2=="A")] <- as.numeric(tp$X1)[which(tp$X2=="A")]/sum(taxGen$A)
+tp$X1[which(tp$X2=="B")] <- as.numeric(tp$X1)[which(tp$X2=="B")]/sum(taxGen$B)
+100-(mean(as.numeric(tp$X1)[which(tp$X2=="B")])*100/mean(as.numeric(tp$X1)[which(tp$X2=="A")]))
+#43.62
+
+svg("V.Significant.Species.Lachnospiraceae.Fusicatenibacter.svg")
+vioplot(as.numeric(tp$X1)~tp$X2, las=2, ylab="Relative abundance (%)", main= taxGen[17,5:6], xlab="", xaxt="n")
+axis(1, at=1:2, labels=c("-", "Enz"))
+dev.off()
+
+```
+
+```{r }
+physeq_raref_ord <-tax_glom(physeq_raref, taxrank=rank_names(physeq)[4], NArm=TRUE, bad_empty=c(NA, "", " ", "\t"))
+
+plot_bar(physeq_raref_ord, fill = "Order") +
+  geom_bar(aes(color=Order, fill=Order), stat="identity", position="stack") 
+
+png("bar.order.png", width = 900, height = 900, pointsize = 10)
+plot_bar(physeq_raref, fill = "Order") +
+  geom_bar(aes(color=Order, fill=Order), stat="identity", position="stack") 
+dev.off()
+```
+
+
+```{r }
+
+ gen_table<-otu_table(physeq_raref_gen)
+#physeq_raref_gen_filt: filter out the genera seen in less than 3 samples
+ physeq_raref_gen_filt<-prune_taxa(colSums(gen_table==0)<dim(gen_table)[1]-3,physeq_raref_gen)
+
+ gen_table_filt<-otu_table(physeq_raref_ord)
+#SAM = SAM
+ SAM<-as.data.frame(as.matrix(sample_data(physeq_raref_gen)))
+
+#Annotation of OTUs  
+ tax <- as.data.frame(phyloseq::tax_table(physeq_raref_ord), stringsAsFactors = F)
+#OTU + annotation des OTU + pval + padjust  , ,ncol=6 + nb var
+ #SAM$treatment*SAM$gender
+
+ val= 4
+ taxGen<-cbind(tax,matrix(nrow=dim(gen_table_filt)[2],ncol=val))
+
+SAM$treatment <- as.factor(SAM$treatment)
+SAM$gender <- as.factor(SAM$gender)
+
+```
+
+
+```{r }
+#load("/home/vijonchere/Bureau/4.Projet.en.cours/INTEGRITY/Microbiome/Analyse/Rdata_Integrity.rdata") 
+ #chargement des libraries
+library('DescTools')
+library("agricolae")
+library("tidyverse")
+library("ggpubr")
+library("rstatix")
+
+ for (i in 1:dim(gen_table_filt)[2]){
+#for each OTU
+gen_i<-gen_table[,i]
+
+fit <- lm(as.numeric(gen_i) ~  SAM$treatment*SAM$gender)
+
+for (j in 2:4){
+  taxGen[i,6+j]<-summary(fit)[["coefficients"]][, "Pr(>|t|)"][j]
+  colnames (taxGen)[6+j] <- names(summary(fit)[["coefficients"]][, "Pr(>|t|)"][j])
+}
+
+taxGen[i,11:12]<-aggregate(as.numeric(gen_i), list(paste0(SAM$treatment)), mean)[,2]
+colnames(taxGen)[11:12]<-unique(paste0(SAM$treatment))
+ }
+rownames(taxGen) <- as.integer(1:nrow(taxGen))
+
+for (i in 8:10){  taxGen[,i+5] <- p.adjust(taxGen[,i], method="BH")}
+ colnames(taxGen)[13:15] <- paste(colnames(taxGen)[8:10], "padjust",sep="_")
+write.table(taxGen, "Results.microbiote.order.txt", sep="\t", row.names = F)
+
+taxGen[which(taxGen$`SAM$treatmentB_padjust`<0.05),]
+gen_i <- gen_table[,which(taxGen$`SAM$treatmentB_padjust`<0.05)]
+tp <- data.frame(cbind(as.numeric(gen_i), paste0(SAM$treatment)))
+
+
+svg("Significant.Genre.svg")
+boxplot(as.numeric(tp$X1)~tp$X2, las=2, ylab="Relative abundance", main= taxGen[17,4], xlab="", xaxt="n")
+axis(1, at=1:2, labels=c("-", "Enz"))
+dev.off()
+
+```
